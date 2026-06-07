@@ -4,7 +4,7 @@
 # Named groups (each configurable via zstyle, or falling back to built-in defaults):
 #
 #   zstyle ':zim:systemd-envvar' groups wayland dbus xdg gdm auth ui general
-#   zstyle ':zim:systemd-envvar:wayland' vars WAYLAND_DISPLAY DISPLAY NIRI_SOCKET
+#   zstyle ':zim:systemd-envvar:wayland' vars WAYLAND_DISPLAY DISPLAY
 #   zstyle ':zim:systemd-envvar:extra'   vars MY_CUSTOM_VAR
 #
 # Built-in group defaults mirror tpm-desktop-vars. Override any group's vars
@@ -13,7 +13,7 @@
 (( ${+commands[systemctl]} )) || return 1
 
 local -a enabled_groups
-zstyle -a ':zim:systemd-envvar' groups enabled_groups || enabled_groups=(wayland dbus xdg auth ui general)
+zstyle -a ':zim:systemd-envvar' groups enabled_groups || enabled_groups=(wayland niri dbus xdg gdm auth ui kitty general)
 
 local -a vars
 local group
