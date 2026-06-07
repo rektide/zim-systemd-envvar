@@ -1,0 +1,22 @@
+{
+	"name": "zim-systemd-envvar",
+	"version": "1.0.0",
+	"description": "",
+	"main": "index.js",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/rektide/zim-systemd-envvar.git"
+	},
+	"keywords": [],
+	"author": "rektide de la faye",
+	"license": "MIT",
+	"type": "module",
+	"bugs": {
+		"url": "https://github.com/rektide/zim-systemd-envvar/issues"
+	},
+	"homepage": "https://github.com/rektide/zim-systemd-envvar#readme",
+	"module": "zim-systemd-envvar.js"
+}
