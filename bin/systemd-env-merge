@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# systemd-env-merge -- push env vars into the systemd manager without stomping
+# path-like variables.
+#
+# Why this exists:
+#   `systemctl [--user] set-environment KEY=VAL` REPLACES each variable. For
+#   colon-separated path vars (PATH, PYTHONPATH, MANPATH, ...) that is wrong:
+#   they are accumulated across many sources (shell rc, pnpm, mise, cargo, ...)
+#   so a replace drops entries and loses to last-writer-wins races. This helper
+#   instead MERGES path-like vars (ordered union, de-duplicated) and replaces
+#   scalar vars. It is the reusable backend for the merge mode tracked in
+#   zse-pathmerge / zse-mergehelper, usable by any unit or shell hook.
+#
+# Subcommands:
+#   push      Merge one or more KEY=VAL assignments into the manager now.
+#             This is the "Shape A" pattern: a service's ExecStart calls this
+#             instead of set-environment directly. No ExecStartPre/Post needed.
+#             New path entries are placed FIRST (take precedence); existing
+#             manager entries not already present are kept after them.
+#   snapshot  Write selected manager vars (or all of them) to a file/stdout.
+#   restore   Merge a snapshot file back into the manager (path-like vars
+#             only). This is the "Shape B" pattern for retrofitting a unit that
+#             already stomps in its ExecStart:
+#                 ExecStartPre =systemd-env-merge snapshot -o %t/%n.snap PATH
+#                 ExecStart    =<the unit's existing set-environment>
+#                 ExecStartPost=systemd-env-merge restore --pathlike PATH %t/%n.snap
+#             Current manager entries take precedence; snapshot entries that
+#             went missing are appended back (so a stomp becomes an append).
+#
+# Scope:
+#   --user (default) -> `systemctl --user`. Right for login-session services
+#                       and shell-startup sync.
+#   --system         -> `systemctl` (needs root; rarely wanted here).
+#
+# Note on values:
+#   systemd performs its own $VAR expansion on set-environment values. This
+#   helper passes values through verbatim, so callers should hand it literal
+#   resolved values (the way `mise env -J` does), not strings containing $.
+#
+# Exit codes: 0 ok / nothing-to-do, 1 usage, 2 systemctl failure.
+# shellcheck shell=bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# global state
+# ---------------------------------------------------------------------------
+SCOPE="--user"          # "--user" (default) or "" for system scope
+PATHLIKE=(PATH)         # vars treated as colon-split ordered-union merge
+DRY_RUN=0               # 1 -> print the set-environment line, change nothing
+declare -A CUR=()       # snapshot of the manager env: KEY -> VALUE
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+# Invoke systemctl with the chosen scope. $1.. are passed through unchanged.
+sc() {
+    if [[ $SCOPE == "--user" ]]; then
+        systemctl --user "$@"
+    else
+        systemctl "$@"
+    fi
+}
+
+# Refresh CUR from `systemctl <scope> show-environment`. Splits each line on
+# the FIRST '=' so values may themselves contain '='.
+load_current() {
+    CUR=()
+    local line key val
+    while IFS= read -r line; do
+        [[ -z $line ]] && continue
+        key=${line%%=*}
+        val=${line#*=}
+        [[ -n $key ]] && CUR[$key]=$val
+    done < <(sc show-environment)
+}
+
+# Is KEY in the path-like set? (PATH plus anything added via --pathlike.)
+is_pathlike() {
+    local key=$1 i
+    for i in "${PATHLIKE[@]}"; do
+        [[ $i == "$key" ]] && return 0
+    done
+    return 1
+}
+
+# Ordered union of two colon-separated lists, de-duplicated, first-seen order.
+# Args: FIRST SECOND. Entries of FIRST come before SECOND's; duplicates (by
+# exact string match) are dropped. Empty fields are skipped. Prints the joined
+# result on stdout (colon-separated, no trailing colon).
+merge_path() {
+    local first=$1 second=$2
+    local -A seen=()
+    local -a out=()
+    local -a a b
+    local entry
+    # `IFS=: read -ra` splits safely on ':' (survives entries with spaces).
+    IFS=: read -ra a <<< "$first" || true
+    IFS=: read -ra b <<< "$second" || true
+    for entry in "${a[@]}" "${b[@]}"; do
+        [[ -z $entry ]] && continue
+        if [[ -z ${seen[$entry]+x} ]]; then
+            seen[$entry]=1
+            out+=("$entry")
+        fi
+    done
+    [[ ${#out[@]} -eq 0 ]] && return 0
+    local IFS=:
+    printf '%s\n' "${out[*]}"
+}
+
+# Run (or dry-run print) one set-environment call with the given KEY=VAL args.
+emit() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf 'DRY-RUN [%s] set-environment %s\n' "$SCOPE" "$*" >&2
+        return 0
+    fi
+    sc set-environment "$@" || {
+        echo "systemd-env-merge: systemctl set-environment failed" >&2
+        exit 2
+    }
+}
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+cmd_push() {
+    local -a assignments=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user) SCOPE="--user"; shift ;;
+            --system) SCOPE=""; shift ;;
+            --pathlike)
+                shift
+                [[ $# -gt 0 ]] || { echo "push: --pathlike needs a VAR name" >&2; exit 1; }
+                PATHLIKE+=("$1")
+                shift
+                ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --) shift; while [[ $# -gt 0 ]]; do assignments+=("$1"); shift; done ;;
+            -*) echo "push: unknown option: $1" >&2; exit 1 ;;
+            *) assignments+=("$1"); shift ;;
+        esac
+    done
+    [[ ${#assignments[@]} -gt 0 ]] || { echo "push: no KEY=VAL assignment given" >&2; exit 1; }
+
+    load_current
+    local -a set_args=()
+    local a key val merged
+    for a in "${assignments[@]}"; do
+        [[ $a == *=* ]] || { echo "push: not KEY=VAL: $a" >&2; exit 1; }
+        key=${a%%=*}
+        val=${a#*=}
+        if is_pathlike "$key"; then
+            # New value first (precedence), then existing manager entries kept.
+            merged=$(merge_path "$val" "${CUR[$key]:-}")
+            [[ $merged == "${CUR[$key]:-}" ]] && continue
+            set_args+=("$key=$merged")
+        else
+            [[ $val == "${CUR[$key]:-}" ]] && continue
+            set_args+=("$key=$val")
+        fi
+    done
+
+    [[ ${#set_args[@]} -eq 0 ]] && { echo "systemd-env-merge: nothing changed" >&2; return 0; }
+    emit "${set_args[@]}"
+    echo "systemd-env-merge: pushed ${#set_args[@]} var(s) (scope=${SCOPE:-system})" >&2
+}
+
+cmd_snapshot() {
+    local outfile="" vars_only=0
+    local -a vars=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user) SCOPE="--user"; shift ;;
+            --system) SCOPE=""; shift ;;
+            -o) shift; [[ $# -gt 0 ]] || { echo "snapshot: -o needs a FILE" >&2; exit 1; }; outfile=$1; shift ;;
+            --) shift; while [[ $# -gt 0 ]]; do vars+=("$1"); shift; done ;;
+            -*) echo "snapshot: unknown option: $1" >&2; exit 1 ;;
+            *) vars+=("$1"); shift ;;
+        esac
+    done
+    [[ ${#vars[@]} -gt 0 ]] && vars_only=1
+
+    load_current
+    local key body=""
+    if [[ $vars_only -eq 1 ]]; then
+        for key in "${vars[@]}"; do
+            [[ -n ${CUR[$key]+x} ]] && body+="${key}=${CUR[$key]}"$'\n'
+        done
+    else
+        for key in "${!CUR[@]}"; do
+            body+="${key}=${CUR[$key]}"$'\n'
+        done
+    fi
+
+    if [[ -z $outfile || $outfile == "-" ]]; then
+        printf '%s' "$body"
+    else
+        printf '%s' "$body" > "$outfile"
+    fi
+}
+
+cmd_restore() {
+    local file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user) SCOPE="--user"; shift ;;
+            --system) SCOPE=""; shift ;;
+            --pathlike)
+                shift
+                [[ $# -gt 0 ]] || { echo "restore: --pathlike needs a VAR name" >&2; exit 1; }
+                PATHLIKE+=("$1")
+                shift
+                ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --) shift; while [[ $# -gt 0 ]]; do file=$1; shift; done ;;
+            -*) echo "restore: unknown option: $1" >&2; exit 1 ;;
+            *) file=$1; shift ;;
+        esac
+    done
+    [[ -n $file ]] || { echo "restore: snapshot FILE required" >&2; exit 1; }
+    [[ -r $file ]] || { echo "restore: cannot read snapshot: $file" >&2; exit 1; }
+
+    load_current
+    local -a set_args=()
+    local line key val merged
+    # Only path-like vars are restored: the unit's ExecStart set scalars on
+    # purpose, so we must not clobber them. Current manager entries keep
+    # precedence; snapshot entries that vanished are appended back.
+    while IFS= read -r line; do
+        [[ -z $line ]] && continue
+        key=${line%%=*}
+        val=${line#*=}
+        is_pathlike "$key" || continue
+        merged=$(merge_path "${CUR[$key]:-}" "$val")
+        [[ $merged == "${CUR[$key]:-}" ]] && continue
+        set_args+=("$key=$merged")
+    done < "$file"
+
+    [[ ${#set_args[@]} -eq 0 ]] && { echo "systemd-env-merge: nothing changed" >&2; return 0; }
+    emit "${set_args[@]}"
+    echo "systemd-env-merge: restored ${#set_args[@]} var(s) (scope=${SCOPE:-system})" >&2
+}
+
+usage() {
+    cat <<'EOF'
+systemd-env-merge -- merge env vars into the systemd manager (no PATH stomping)
+
+Usage:
+  systemd-env-merge push [--user|--system] [--pathlike VAR ...] [--dry-run] KEY=VAL ...
+  systemd-env-merge snapshot [--user|--system] [-o FILE|-] [VAR ...]
+  systemd-env-merge restore [--user|--system] [--pathlike VAR ...] [--dry-run] FILE
+
+  push      merge KEY=VAL assignments; path-like vars are ordered-union+dedup
+            (new entries first), scalars are replaced. Unchanged vars are skipped.
+  snapshot  write manager env (all vars, or just VAR ...) as KEY=VAL lines.
+  restore   merge a snapshot back; only --pathlike vars, current-first union.
+
+Options:
+  --user           target `systemctl --user` (default)
+  --system         target `systemctl` (needs root)
+  --pathlike VAR   also treat VAR as colon-split merge (repeatable; PATH default)
+  --dry-run        print the set-environment call instead of running it
+  -o FILE          write snapshot to FILE (- or omit = stdout)
+  -h | --help      show this help
+
+Examples:
+  # mise-user-env pushes tool vars, merging PATH (no stomp):
+  mapfile -t kv < <(cd "$HOME" && mise env -J | jq -r 'to_entries[]|"\(.key)=\(.value)"')
+  systemd-env-merge push --pathlike PATH -- "${kv[@]}"
+
+  # Retrofit a unit that stomps PATH in its ExecStart:
+  #   ExecStartPre =systemd-env-merge snapshot -o %t/%n.snap PATH
+  #   ExecStartPost=systemd-env-merge restore --pathlike PATH %t/%n.snap
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+main() {
+    local sub=""
+    [[ $# -gt 0 ]] && { sub=$1; shift; }
+    case "$sub" in
+        push) cmd_push "$@" ;;
+        snapshot) cmd_snapshot "$@" ;;
+        restore) cmd_restore "$@" ;;
+        "" | -h | --help | help) usage ;;
+        *) echo "systemd-env-merge: unknown subcommand: $sub" >&2; usage >&2; exit 1 ;;
+    esac
+}
+
+main "$@"

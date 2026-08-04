@@ -43,6 +43,37 @@ The `systemd-envvar-sync` function is also available as an interactive command:
 systemd-envvar-sync
 ```
 
+## Helper for other services: `bin/systemd-env-merge`
+
+`systemctl [--user] set-environment KEY=VAL` **replaces** each variable, which
+stomps on path-like vars (`PATH`, `PYTHONPATH`, …) that are meant to be
+accumulated. `bin/systemd-env-merge` is a standalone bash helper any unit or
+hook can call instead — it **merges** path-like vars (ordered union + dedup)
+and replaces scalars. Shellcheck-clean; see `systemd-env-merge --help`.
+
+Two patterns:
+
+**Shape A — atomic (preferred for new units).** A service's `ExecStart` calls
+`push` instead of `set-environment`:
+
+```bash
+mapfile -t kv < <(cd "$HOME" && mise env -J | jq -r 'to_entries[]|"\(.key)=\(.value)"')
+systemd-env-merge push --pathlike PATH -- "${kv[@]}"
+```
+
+**Shape B — retrofit a unit that already stomps.** Snapshot before, merge after:
+
+```ini
+ExecStartPre =systemd-env-merge snapshot -o %t/%n.snap PATH
+ExecStart    =<the existing set-environment>
+ExecStartPost=systemd-env-merge restore --pathlike PATH %t/%n.snap
+```
+
+`push`/`restore` precedence: `push` puts new entries **first** (caller wins);
+`restore` keeps current manager entries first and appends back any snapshot
+entries that went missing (so a stomp becomes an append). Both skip unchanged
+vars and no-op when there is nothing to do.
+
 ## Install
 
 Add to your `~/.zimrc`:
