@@ -4,6 +4,8 @@
 
 Every new shell session checks whether whitelisted env vars have drifted from `systemctl --user show-environment` and imports only the ones that changed. An md5 hash cache in `$XDG_RUNTIME_DIR` makes the no-change case essentially free.
 
+Only vars that are **set and exported** in the shell are imported. zsh keeps some parameters (e.g. `USERNAME`) set-but-unexported; `systemctl import-environment` reads the process environment, so such a var would warn and never converge — the sync skips them instead and reports them in **one batched line per group** (`systemd-envvar-sync: <group>: unset or unexported, skipped: …`), and only for groups that have at least one importable member, so groups for features you are not using stay silent. A shell whose importable values match the cache is a complete no-op.
+
 ## Variable groups
 
 Variables are organized into named groups. Enable or disable groups, or override the vars in any group, all via `zstyle` in your `~/.zshrc` **before** the module loads.
@@ -18,7 +20,7 @@ Variables are organized into named groups. Enable or disable groups, or override
 | auth      | `SSH_AUTH_SOCK` `GPG_AGENT_INFO` `XAUTHORITY`                                                                                                   |
 | ui        | `XCURSOR_SIZE` `XCURSOR_THEME` `COLORTERM`                                                                                                      |
 | kitty     | `KITTY_WINDOW_ID` `KITTY_PID` `KITTY_PUBLIC_KEY` `KITTY_LISTEN_ON` `KITTY_INSTALLATION_DIR` `TERMINFO`                                          |
-| general   | `HOME` `LANG` `TZ` `PAGER` `TERM` `PATH` `SHELL` `USER` `USERNAME` `LOGNAME`                                                                    |
+| general   | `HOME` `LANG` `TZ` `PAGER` `TERM` `PATH` `SHELL` `USER` `LOGNAME`                                                                    |
 
 Default enabled groups: **wayland niri dbus xdg gdm auth ui kitty general**.
 

@@ -1,5 +1,12 @@
-# Upsert whitelisted vars into systemd user environment (only changes differing values).
-# Skips entirely when a hash of current values matches the last import.
+# Upsert whitelisted vars into the systemd user environment (only changes differing values).
+# Skips entirely when a hash of the importable values matches the last import.
+#
+# Only vars that are set AND exported reach systemctl: zsh keeps special
+# parameters (USERNAME, UID, EUID, ...) set but unexported, which makes
+# `import-environment` warn and never converge. Whitelisted names that are
+# unset or unexported are reported one batched line per group (only for
+# groups with at least one importable member, so a feature you are not using
+# stays silent).
 #
 # Named groups (each configurable via zstyle, or falling back to built-in defaults):
 #
@@ -15,40 +22,55 @@
 local -a enabled_groups
 zstyle -a ':zim:systemd-envvar' groups enabled_groups || enabled_groups=(wayland niri dbus xdg gdm auth ui kitty general)
 
-local -a vars
-local group
+local -aU vars
+local -A group_of
+local group group_var var
 local -a group_vars
 for group in $enabled_groups; do
+  group_vars=()
   zstyle -a ":zim:systemd-envvar:$group" vars group_vars || case $group in
-    wayland) group_vars=(WAYLAND_DISPLAY DISPLAY NIRI_SOCKET) ;;
+    wayland) group_vars=(WAYLAND_DISPLAY DISPLAY) ;;
+    niri)    group_vars=(NIRI_SOCKET) ;;
     dbus)    group_vars=(DBUS_SESSION_BUS_ADDRESS) ;;
     xdg)     group_vars=(XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE XDG_SESSION_CLASS XDG_SEAT XDG_VTNR DESKTOP_SESSION) ;;
     gdm)     group_vars=(GDMSESSION GDM_LANG DESKTOP_STARTUP_ID) ;;
     auth)    group_vars=(SSH_AUTH_SOCK GPG_AGENT_INFO XAUTHORITY) ;;
     ui)      group_vars=(XCURSOR_SIZE XCURSOR_THEME COLORTERM) ;;
     kitty)   group_vars=(KITTY_WINDOW_ID KITTY_PID KITTY_PUBLIC_KEY KITTY_LISTEN_ON KITTY_INSTALLATION_DIR TERMINFO) ;;
-    general) group_vars=(HOME LANG TZ PAGER TERM PATH SHELL USER USERNAME LOGNAME) ;;
+    general) group_vars=(HOME LANG TZ PAGER TERM PATH SHELL USER LOGNAME) ;;
   esac
   vars+=($group_vars)
+  for group_var in $group_vars; do
+    group_of[$group_var]=$group
+  done
 done
 
 local -a extra_vars
 zstyle -a ':zim:systemd-envvar' extra-vars extra_vars || extra_vars=()
 vars+=($extra_vars)
+for group_var in $extra_vars; do
+  group_of[$group_var]=extra
+done
 
 (( $#vars )) || return 0
 
-local current_hash=
-local val
+# Hash the importable values: a var that cannot be imported must not be able
+# to invalidate the cache (that is what made USERNAME re-import every shell).
+local current_hash= cached_hash val
 for var in $vars; do
-  val=${(P)var:-}
+  (( ${(P)+var} )) && [[ ${(Pt)var} == *export* ]] || continue
+  val=${(P)var}
   current_hash+=${#val}:${val},
 done
 current_hash=$(printf '%s' "$current_hash" | command md5sum | command cut -d' ' -f1)
 
 local cache_file=${XDG_RUNTIME_DIR:-/run/user/${UID}}/zim-systemd-envvar.hash
-if [[ -r $cache_file ]] && read -r cached_hash < $cache_file && [[ $cached_hash == $current_hash ]]; then
-  return
+# NB: read -r returns 1 on a file without a trailing newline, so read the
+# cache with $(<file); a failed read here would void the cache and re-import
+# on every shell.
+if [[ -r $cache_file ]]; then
+  cached_hash=$(< $cache_file)
+  [[ $cached_hash == $current_hash ]] && return
 fi
 
 local -A sd_env
@@ -59,9 +81,22 @@ for line in ${(f)"$(systemctl --user show-environment)"}; do
 done
 
 local -a changed
+local -A missing active
 for var in $vars; do
-  (( ${(P)+var} )) && [[ ${(P)var} != ${sd_env[$var]} ]] && changed+=$var
+  if (( ${(P)+var} )) && [[ ${(Pt)var} == *export* ]]; then
+    active[${group_of[$var]:-extra}]=1
+    [[ ${(P)var} != ${sd_env[$var]} ]] && changed+=$var
+  else
+    missing[${group_of[$var]:-extra}]="${missing[${group_of[$var]:-extra}]:+${missing[${group_of[$var]:-extra}]} }$var"
+  fi
 done
 
+# Batched per-group warning, but only for groups that are otherwise in use.
+for group in $enabled_groups extra; do
+  [[ -n ${missing[$group]} ]] && (( ${+active[$group]} )) || continue
+  print -u2 "systemd-envvar-sync: ${group}: unset or unexported, skipped: ${missing[$group]}"
+done
+
+# Idempotent import: one call, only vars whose value actually differs.
 (( $#changed )) && systemctl --user import-environment ${(@)changed}
-printf '%s' "$current_hash" >| $cache_file
+printf '%s\n' "$current_hash" >| $cache_file
