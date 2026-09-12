@@ -4,7 +4,7 @@
 
 Every new shell session checks whether whitelisted env vars have drifted from `systemctl --user show-environment` and imports only the ones that changed. An md5 hash cache in `$XDG_RUNTIME_DIR` makes the no-change case essentially free.
 
-Only vars that are **set and exported** in the shell are imported. zsh keeps some parameters (e.g. `USERNAME`) set-but-unexported; `systemctl import-environment` reads the process environment, so such a var would warn and never converge — the sync skips them instead. Diagnostics (skipped vars per group, and the imported batch) go to the **journal**, not the terminal: `journalctl --user -t zim-systemd-envvar`. Only groups with at least one importable member are reported, so groups for features you are not using stay silent, and a shell whose importable values match the cache is a complete no-op.
+Only vars that are **set and exported** in the shell are imported. zsh keeps some parameters (e.g. `USERNAME`) set-but-unexported; `systemctl import-environment` reads the process environment, so such a var would warn and never converge — the sync skips them instead. Diagnostics go to the **journal** as a single line per import run (imported batch + skipped groups): `journalctl --user -t zim-systemd-envvar`. Only groups with at least one importable member are listed, so groups for features you are not using stay silent, and a shell whose importable values match the cache is a complete no-op.
 
 ## Variable groups
 

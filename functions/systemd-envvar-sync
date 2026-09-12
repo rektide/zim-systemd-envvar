@@ -4,9 +4,9 @@
 # Only vars that are set AND exported reach systemctl: zsh keeps special
 # parameters (USERNAME, UID, EUID, ...) set but unexported, which makes
 # `import-environment` warn and never converge. Whitelisted names that are
-# unset or unexported are journaled (one batched line per group, only for
-# groups with at least one importable member, so a feature you are not
-# using stays silent) instead of printed to the terminal.
+# unset or unexported are journaled (one single-line entry per import run,
+# only listing groups with at least one importable member, so a feature you
+# are not using stays silent) instead of printed to the terminal.
 #
 # Named groups (each configurable via zstyle, or falling back to built-in defaults):
 #
@@ -93,14 +93,19 @@ done
 
 # Diagnostics go to the journal, not the terminal: imports happen per
 # hash-miss (e.g. every new kitty window), so terminal output is noise.
-# Query with: journalctl --user -t zim-systemd-envvar
-local -a report
+# One single-line entry per import run. Query with:
+#   journalctl --user -t zim-systemd-envvar
+local -a parts
+local skipped=
+if (( $#changed )); then
+  parts+=("imported: ${(j: :)changed}")
+fi
 for group in $enabled_groups extra; do
-  [[ -n ${missing[$group]} ]] && (( ${+active[$group]} )) && report+=("skipped ${group}: unset or unexported: ${missing[$group]}")
+  [[ -n ${missing[$group]} ]] && (( ${+active[$group]} )) && skipped+="${group}(${missing[$group]}) "
 done
-(( $#changed )) && report+=("imported: ${changed[*]}")
-if (( $#report )) && (( ${+commands[systemd-cat]} )); then
-  print -r -- "${(F)report}" | systemd-cat -t zim-systemd-envvar -p info
+[[ -n $skipped ]] && parts+=("skipped: ${skipped%% }")
+if (( $#parts )) && (( ${+commands[systemd-cat]} )); then
+  print -r -- "${(j: :)parts}" | systemd-cat -t zim-systemd-envvar -p info
 fi
 
 # Terminal-side visibility while debugging a group's var list — un-comment:
